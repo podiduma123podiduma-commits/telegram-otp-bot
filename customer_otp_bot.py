@@ -14,6 +14,9 @@ from bs4 import BeautifulSoup
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
+# ✅ ADDED (only for broadcast error handling)
+from telegram.error import Forbidden, RetryAfter, BadRequest
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -60,6 +63,10 @@ class StateManager:
         data.setdefault("cached_otps", {})
         data.setdefault("cooldowns", {})  # user_id -> next_allowed_ts
         data.setdefault("blocked_emails", {})  # email -> {timestamp, by}
+
+        # ✅ ADDED: store user chat_ids for broadcast
+        data.setdefault("subscribers", [])  # list of chat_ids
+
         return data
 
     def _save_state(self):
@@ -126,6 +133,24 @@ class StateManager:
     def unblock_email(self, email: str) -> bool:
         if email in self.state.get("blocked_emails", {}):
             del self.state["blocked_emails"][email]
+            self._save_state()
+            return True
+        return False
+
+    # ✅ ADDED: subscribers (broadcast users)
+    def add_subscriber(self, chat_id: int):
+        cid = int(chat_id)
+        if cid not in self.state["subscribers"]:
+            self.state["subscribers"].append(cid)
+            self._save_state()
+
+    def get_subscribers(self):
+        return list(self.state.get("subscribers", []))
+
+    def remove_subscriber(self, chat_id: int) -> bool:
+        cid = int(chat_id)
+        if cid in self.state.get("subscribers", []):
+            self.state["subscribers"].remove(cid)
             self._save_state()
             return True
         return False
@@ -231,6 +256,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user:
         return
 
+    # ✅ ADDED: register user for broadcasts
+    if update.effective_chat:
+        state_manager.add_subscriber(update.effective_chat.id)
+
     welcome_text = (
         f"✨ Welcome to Digital Creed OTP Service ✨\n\n"
         f"🔹 Need a quick OTP? Just send:\n"
@@ -252,6 +281,10 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user:
         return
+
+    # ✅ ADDED: register user for broadcasts
+    if update.effective_chat:
+        state_manager.add_subscriber(update.effective_chat.id)
 
     is_admin = user.id in ADMIN_IDS
 
@@ -592,6 +625,85 @@ async def showlog_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Error reading log: {e}")
 
+# ✅ ADDED: Admin broadcast command (/dash)
+async def dash_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
+    user = update.effective_user
+    if not user:
+        return
+
+    if user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+
+    subscribers = state_manager.get_subscribers()
+    if not subscribers:
+        await update.message.reply_text("ℹ️ No users to broadcast to yet.")
+        return
+
+    bot = context.bot
+
+    # 1) If admin REPLIES to a message and sends /dash -> copy that message to everyone (supports images/media)
+    if update.message.reply_to_message:
+        src_chat_id = update.message.reply_to_message.chat_id
+        src_message_id = update.message.reply_to_message.message_id
+
+        sent = 0
+        failed = 0
+
+        for chat_id in subscribers:
+            try:
+                await bot.copy_message(
+                    chat_id=chat_id,
+                    from_chat_id=src_chat_id,
+                    message_id=src_message_id,
+                )
+                sent += 1
+                await asyncio.sleep(0.05)
+            except RetryAfter as e:
+                await asyncio.sleep(int(getattr(e, "retry_after", 1)))
+            except Forbidden:
+                state_manager.remove_subscriber(chat_id)
+                failed += 1
+            except BadRequest:
+                failed += 1
+            except Exception:
+                failed += 1
+
+        await update.message.reply_text(f"✅ Broadcast done. Sent: {sent}, Failed: {failed}")
+        return
+
+    # 2) Otherwise /dash <text> -> send text to everyone
+    if not context.args:
+        await update.message.reply_text(
+            "❌ Usage:\n"
+            "1) /dash <text to broadcast>\n"
+            "2) Reply to a message (photo/text/etc) with /dash to broadcast it."
+        )
+        return
+
+    text = " ".join(context.args)
+
+    sent = 0
+    failed = 0
+
+    for chat_id in subscribers:
+        try:
+            await bot.send_message(chat_id=chat_id, text=text)
+            sent += 1
+            await asyncio.sleep(0.05)
+        except RetryAfter as e:
+            await asyncio.sleep(int(getattr(e, "retry_after", 1)))
+        except Forbidden:
+            state_manager.remove_subscriber(chat_id)
+            failed += 1
+        except Exception:
+            failed += 1
+
+    await update.message.reply_text(f"✅ Broadcast done. Sent: {sent}, Failed: {failed}")
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Update {update} caused error {context.error}")
 
@@ -622,6 +734,10 @@ def main():
     application.add_handler(CommandHandler("block", block_command))
     application.add_handler(CommandHandler("unblock", unblock_command))
     application.add_handler(CommandHandler("log", showlog_command))
+
+    # ✅ ADDED: /dash broadcast handler
+    application.add_handler(CommandHandler("dash", dash_command))
+
     application.add_error_handler(error_handler)
 
     application.run_polling(allowed_updates=Update.ALL_TYPES)
